@@ -403,22 +403,22 @@ class BulkFixDialog(QDialog):
     """拡張子をまとめて直す前に、変更の一覧を見せて確かめてもらう。"""
 
     def __init__(self, plan, parent=None):
-        """plan: [(パス, 今の名前, 新しい名前, 中身の種類), ...]"""
+        """plan: [(パス, 今の名前, 新しい名前, 中身の種類, はじめにチェックするか), ...]"""
         from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
 
         super().__init__(parent)
         self.setWindowTitle("拡張子をまとめて直す")
         self.resize(640, 420)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"次の {len(plan)} 個の拡張子を直します。直さないものはチェックを外してください。"))
+        layout.addWidget(QLabel(f"次の {len(plan)} 個の拡張子を直せます。直すものにチェックを付けてください。"))
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["今の名前", "新しい名前", "中身"])
         self.tree.setRootIsDecorated(False)
         self.tree.setColumnWidth(0, 220)
         self.tree.setColumnWidth(1, 220)
-        for path, old, new, kind in plan:
+        for path, old, new, kind, checked in plan:
             item = QTreeWidgetItem([old, new, kind])
-            item.setCheckState(0, Qt.Checked)
+            item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
             item.setData(0, Qt.UserRole, path)
             item.setToolTip(0, path)
             self.tree.addTopLevelItem(item)
@@ -435,6 +435,7 @@ class BulkFixDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.tree.itemChanged.connect(lambda *_: self.ok.setEnabled(bool(self.chosen())))
+        self.ok.setEnabled(bool(self.chosen()))
 
     def chosen(self):
         result = []

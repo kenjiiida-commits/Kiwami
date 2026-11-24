@@ -314,10 +314,15 @@ def _reason(e):
 
 def bulk_change_extensions(plan, label="拡張子をまとめて直す"):
     """plan: [(パス, 新しい拡張子), ...]。(GroupOp, {古いパス: 新しいパス}, [(パス, 理由), ...]) を返す。"""
+    return bulk_rename([(p, name_with_extension(os.path.basename(p), ext)) for p, ext in plan], label)
+
+
+def bulk_rename(plan, label="名前をまとめて変更"):
+    """plan: [(パス, 新しい名前), ...]。(GroupOp, {古いパス: 新しいパス}, [(パス, 理由), ...]) を返す。"""
     ops, moved, failed = [], {}, []
-    for path, ext in plan:
+    for path, new_name in plan:
         try:
-            new_path, op = change_extension(path, ext)
+            new_path, op = rename(path, new_name)
         except (OSError, ValueError) as e:
             failed.append((path, _reason(e)))
             continue

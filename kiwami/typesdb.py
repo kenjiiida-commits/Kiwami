@@ -133,7 +133,11 @@ class TypeDB:
         self.user_signatures = [e for e in sigs if id(e) in user_ids]
         self.builtin_signatures = [e for e in sigs if id(e) not in user_ids]
         self.binary_exts = set()
+        self.text_exts = set()
         for e in entries:
+            if e.text:
+                self.text_exts.update(e.exts)
+                self.text_exts.update(x for x in e.also if "." not in x)
             if not e.text and not e.any_ext:
                 self.binary_exts.update(e.exts)
                 self.binary_exts.update(x for x in e.also if "." not in x)

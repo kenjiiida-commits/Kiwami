@@ -55,6 +55,54 @@ class FileInfo:
     from_signature: bool = False  # 辞書の先頭バイト列で判別した
     status: str | None = None
     suggestions: list[str] = field(default_factory=list)  # 直す候補（"" は拡張子を外す）
+    txt_name: str = ""  # .txt にしてもよいテキストなら、その新しい名前（そうでなければ ""）
+
+
+# 意味のある拡張子（.txt にしようとは言わない）。辞書のテキスト系の拡張子もこれに加わる。
+KNOWN_TEXT_EXTS = {
+    "txt", "text", "md", "markdown", "rst", "adoc", "org", "tex", "bib", "log", "ini", "cfg", "conf",
+    "config", "toml", "yaml", "yml", "json", "jsonl", "xml", "html", "htm", "xhtml", "css", "scss", "less",
+    "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "py", "pyw", "pyi", "sh", "bash", "zsh", "fish", "bat",
+    "cmd", "ps1", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "kt", "kts", "go", "rs", "rb", "php",
+    "pl", "pm", "lua", "swift", "dart", "scala", "cs", "vb", "fs", "r", "m", "jl", "hs", "ml", "clj", "lisp",
+    "el", "vim", "sql", "csv", "tsv", "srt", "vtt", "ass", "ssa", "sub", "lrc", "cue", "m3u", "m3u8", "pls",
+    "desktop", "service", "socket", "timer", "properties", "env", "diff", "patch", "po", "pot", "ics", "vcf",
+    "eml", "mbox", "nfo", "url", "reg", "inf", "asm", "s", "gradle", "cmake", "mk", "mak", "dockerfile",
+    "gitignore", "gitattributes", "editorconfig", "lock", "sum", "mod", "asc", "pem", "crt", "csr", "key",
+    "pub", "svg", "rss", "atom", "kml", "gpx", "gml", "plist", "strings", "rc", "manifest", "webmanifest",
+    "map", "ipynb", "arb", "lst", "cnf", "sample", "tmpl", "template", "j2", "ejs", "hbs", "mustache",
+}
+# 拡張子なしが普通のファイル名（大文字小文字は区別しない）
+KNOWN_TEXT_NAMES = {
+    "readme", "license", "licence", "copying", "authors", "contributors", "changelog", "changes", "news",
+    "install", "todo", "makefile", "gnumakefile", "dockerfile", "containerfile", "vagrantfile", "gemfile",
+    "rakefile", "procfile", "brewfile", "jenkinsfile", "pipfile", "notice", "version", "manifest",
+}
+
+
+def _plausible_ext(ext):
+    """拡張子らしいか（英数字 1〜6 文字で、数字だけではない）。"""
+    return 1 <= len(ext) <= 6 and ext.isascii() and ext.isalnum() and not ext.isdigit()
+
+
+def txt_rename_target(info, text_exts=()):
+    """.txt にしてもよさそうなテキストなら新しい名前を、そうでなければ "" を返す。"""
+    if info.kind != "file" or info.error or info.status != OK_TEXT or info.mime != "text/plain":
+        return ""
+    name = info.name
+    if name.startswith("."):
+        return ""  # .bashrc などの設定ファイル
+    stem, ext = split_name(name)
+    if stem.lower() in KNOWN_TEXT_NAMES or name.lower() in KNOWN_TEXT_NAMES:
+        return ""
+    if info.mode & 0o111:
+        return ""  # 実行できる印が付いている（スクリプトかもしれない）
+    cur = ext.lower()
+    if cur and (cur in KNOWN_TEXT_EXTS or cur in text_exts or cur.rsplit(".", 1)[-1] in KNOWN_TEXT_EXTS):
+        return ""
+    if cur and _plausible_ext(cur):
+        return f"{stem}.txt"  # 見慣れない拡張子（.dat など）は .txt に置き換える
+    return f"{name}.txt"  # 拡張子なし、または「v1.2」の「2」のように拡張子らしくないものは付け足す
 
 
 def split_name(name):
@@ -233,6 +281,8 @@ def inspect(path, db=None):
             entry = db.lookup(info.mime)
         info.type_name = entry.name if entry else ""
         judge(info, entry, db.binary_exts)
+    if db is not None:
+        info.txt_name = txt_rename_target(info, db.text_exts)
     if info.mime.startswith("text/") or info.status == OK_TEXT or info.mime == "application/json":
         # 日本語の文字コードは判別エンジンより自前の判定のほうが正確
         try:

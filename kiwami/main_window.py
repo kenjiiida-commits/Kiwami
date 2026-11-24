@@ -50,7 +50,7 @@ from .fileops import (
     GroupOp,
     History,
     RenameOp,
-    bulk_change_extensions,
+    bulk_rename,
     bulk_set_mode,
     bulk_set_times,
     UndoConflict,
@@ -67,6 +67,7 @@ from .typesdb import TypeDB
 from .viewer import ViewerWindow
 
 PATH_ROLE = Qt.UserRole
+TXT = "__txt__"  # 「.txt にする」の印
 ICON_PATH = os.path.join(os.path.dirname(__file__), "data", "kiwami.svg")
 MANY = 100  # これより多いときは、進み具合の窓を出して裏で調べる
 FOLDER_LIMIT = 20000  # フォルダーの中身を一覧に入れる上限
@@ -96,6 +97,11 @@ def _short_type(info):
         return "エラー"
     text = _type_text(info)
     return text if len(text) <= 40 else text[:39] + "…"
+
+
+def _needs_fix(info):
+    """拡張子が違う・ないもので、直す候補があるもの。"""
+    return info.status in (MISMATCH, NOEXT) and bool(info.suggestions) and info.suggestions[0] != ""
 
 
 def _ext_label(ext):
@@ -216,7 +222,8 @@ class MainWindow(QMainWindow):
         self.fix_row = QWidget()
         fix_layout = QHBoxLayout(self.fix_row)
         fix_layout.setContentsMargins(0, 0, 0, 0)
-        fix_layout.addWidget(QLabel("正しい拡張子："))
+        self.fix_label = QLabel("正しい拡張子：")
+        fix_layout.addWidget(self.fix_label)
         self.fix_combo = QComboBox()
         fix_layout.addWidget(self.fix_combo, 1)
         self.fix_button = QPushButton("この拡張子に直す")
@@ -469,6 +476,9 @@ class MainWindow(QMainWindow):
         # ドロップしてから中身や名前が変わっていないか確かめ直す
         self._reload_dict()
         fresh = inspect(info.path, self.db)
+        if new_ext == TXT:
+            self._rename_to_txt(fresh)
+            return
         if fresh.status not in (MISMATCH, NOEXT, MAYBE):
             item = self._set_info(fresh)
             self.list.setCurrentItem(item)
@@ -484,6 +494,25 @@ class MainWindow(QMainWindow):
                 f"同じ名前のファイルがすでにあるため、変更しませんでした。\n\n"
                 f"{fresh.name} → {name_with_extension(fresh.name, new_ext)}",
             )
+            return
+        except (OSError, ValueError) as e:
+            self._warn("名前を変更できませんでした。", e)
+            return
+        self.history.push(op)
+        self._path_changed(fresh.path, new_path)
+        self._show_message(f"「{fresh.name}」→「{os.path.basename(new_path)}」に変更しました")
+
+    def _rename_to_txt(self, fresh):
+        if not fresh.txt_name:
+            item = self._set_info(fresh)
+            self.list.setCurrentItem(item)
+            self._show_info(fresh)
+            self._show_message("ファイルの状態が変わっていたため、判定し直しました")
+            return
+        try:
+            new_path, op = rename(fresh.path, fresh.txt_name)
+        except FileExistsError:
+            QMessageBox.warning(self, APP_NAME, f"「{fresh.txt_name}」がすでにあるため、変更しませんでした。")
             return
         except (OSError, ValueError) as e:
             self._warn("名前を変更できませんでした。", e)
@@ -619,24 +648,30 @@ class MainWindow(QMainWindow):
     def _bulk_candidates(self):
         selected = [self.infos.get(i.data(0, PATH_ROLE)) for i in self.list.selectedItems()]
         pool = selected if len(selected) > 1 else list(self.infos.values())
-        return [i for i in pool if i is not None and i.status in (MISMATCH, NOEXT) and i.suggestions
-                and i.suggestions[0] != ""]
+        return [i for i in pool if i is not None and (_needs_fix(i) or i.txt_name)]
 
     def bulk_fix(self):
         self._reload_dict()
         fresh = [inspect(i.path, self.db) for i in self._bulk_candidates()]
-        fresh = [i for i in fresh if i.status in (MISMATCH, NOEXT) and i.suggestions and i.suggestions[0]]
+        fresh = [i for i in fresh if _needs_fix(i) or i.txt_name]
         if not fresh:
             self._refresh_paths([i.path for i in self._bulk_candidates()])
             self._show_message("直すものはありません")
             return
-        plan = [(i.path, i.name, name_with_extension(i.name, i.suggestions[0]), i.type_name) for i in fresh]
+        plan = []
+        for i in fresh:
+            if _needs_fix(i):
+                plan.append((i.path, i.name, name_with_extension(i.name, i.suggestions[0]), i.type_name, True))
+            else:
+                # テキストを .txt にするのは任意なので、はじめはチェックを外しておく
+                plan.append((i.path, i.name, i.txt_name, "テキスト（任意）", False))
         dialog = BulkFixDialog(plan, self)
         if dialog.exec() != BulkFixDialog.Accepted:
             return
         chosen = set(dialog.chosen())
-        group, moved, failed = bulk_change_extensions(
-            [(i.path, i.suggestions[0]) for i in fresh if i.path in chosen])
+        targets = {p: new for p, _, new, _, _ in plan}
+        group, moved, failed = bulk_rename(
+            [(p, targets[p]) for p, *_ in plan if p in chosen], label="拡張子をまとめて直す")
         self.history.push(group)
         for old, new in moved.items():
             self._path_changed(old, new, select=False)
@@ -975,6 +1010,16 @@ class MainWindow(QMainWindow):
         self.banner.show()
 
     def _show_fix_row(self, info):
+        if info is not None and info.txt_name:
+            self.fix_combo.clear()
+            self.fix_combo.addItem(info.txt_name, TXT)
+            self.fix_label.setText("新しい名前：")
+            self.fix_button.setText(".txt にする")
+            self.fix_button.setToolTip("テキストなので、.txt にしておくと他のソフトでも開きやすくなります（任意）")
+            self.fix_row.show()
+            return
+        self.fix_label.setText("正しい拡張子：")
+        self.fix_button.setToolTip("")
         if info is None or info.status not in (MISMATCH, NOEXT, MAYBE) or not info.suggestions:
             self.fix_row.hide()
             return

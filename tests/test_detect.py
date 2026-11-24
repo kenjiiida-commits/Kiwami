@@ -179,6 +179,54 @@ class InspectTest(unittest.TestCase):
         self.assertEqual(inspect(os.path.join(self.dir, "nothing"), self.db).kind, "missing")
 
 
+class TxtOfferTest(unittest.TestCase):
+    """テキストを .txt にするボタンを出すかどうか。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.db = TypeDB(user_path=os.path.join(self.dir, "user-types.json"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def offer(self, name, data="これはテキストのメモです。\nhello world\n", mode=0o644):
+        path = os.path.join(self.dir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(path, mode)
+        return inspect(path, self.db).txt_name
+
+    def test_no_extension(self):
+        self.assertEqual(self.offer("カシミール3Dみたいなもの"), "カシミール3Dみたいなもの.txt")
+
+    def test_unfamiliar_extension_is_replaced(self):
+        self.assertEqual(self.offer("memo.dat"), "memo.txt")
+        self.assertEqual(self.offer("記録.bak"), "記録.txt")
+
+    def test_number_like_extension_is_kept(self):
+        self.assertEqual(self.offer("議事録 v1.2"), "議事録 v1.2.txt")
+        self.assertEqual(self.offer("第3.5版のメモ"), "第3.5版のメモ.txt")
+
+    def test_meaningful_extensions_are_left_alone(self):
+        for name in ("a.txt", "notes.md", "app.log", "settings.ini", "data.csv", "a.py", "page.html", "x.TXT"):
+            self.assertEqual(self.offer(name), "", name)
+
+    def test_known_names_and_dotfiles(self):
+        for name in ("README", "LICENSE", "Makefile", ".bashrc", "readme"):
+            self.assertEqual(self.offer(name), "", name)
+
+    def test_scripts_are_left_alone(self):
+        self.assertEqual(self.offer("myscript", "#!/bin/bash\necho hi\n"), "")
+        self.assertEqual(self.offer("tool", "hello world\n", mode=0o755), "")
+
+    def test_binary_is_not_offered(self):
+        path = os.path.join(self.dir, "pic")
+        with open(path, "wb") as f:
+            f.write(PNG_1PX)
+        self.assertEqual(inspect(path, self.db).txt_name, "")
+
+
 class UserDictTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
