@@ -35,7 +35,8 @@ from .detect import (
     inspect,
     name_with_extension,
 )
-from .dialogs import ModeDialog, RenameDialog, TimesDialog
+from . import packer
+from .dialogs import CompressDialog, ModeDialog, PasswordDialog, RenameDialog, TimesDialog
 from .fileops import (
     History,
     RenameOp,
@@ -47,6 +48,7 @@ from .fileops import (
     set_mode,
     set_times,
 )
+from .jobs import run_job
 from .typesdb import TypeDB
 from .viewer import ViewerWindow
 
@@ -131,6 +133,7 @@ class MainWindow(QMainWindow):
         self.list.setHeaderLabels(["名前", "種類"])
         self.list.setRootIsDecorated(False)
         self.list.setAlternatingRowColors(True)
+        self.list.setSelectionMode(QTreeWidget.ExtendedSelection)  # 圧縮のため複数選べる
         self.list.setColumnWidth(0, 200)
         self.list.currentItemChanged.connect(self._show_current)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -160,6 +163,20 @@ class MainWindow(QMainWindow):
         ops.addStretch(1)
         ops.addWidget(self.undo_button)
         layout.addLayout(ops)
+
+        # 圧縮・解凍の列
+        pack = QHBoxLayout()
+        self.extract_button = QPushButton("解凍する")
+        self.extract_button.setToolTip("同じ場所に新しいフォルダーを作って、その中へ出します")
+        self.extract_button.clicked.connect(self.extract_current)
+        self.compress_button = QPushButton("圧縮する…")
+        self.compress_button.setToolTip("一覧で選んだもの（Ctrl や Shift で複数選べます）をまとめます")
+        self.compress_button.clicked.connect(self.compress_selected)
+        pack.addWidget(self.extract_button)
+        pack.addWidget(self.compress_button)
+        pack.addStretch(1)
+        layout.addLayout(pack)
+        self.list.itemSelectionChanged.connect(self._update_pack_buttons)
 
         # 判定の帯
         self.banner = QLabel()
@@ -496,6 +513,112 @@ class MainWindow(QMainWindow):
             return
         ViewerWindow(info, self).show()
 
+    # ---- 圧縮・解凍 ----
+    def _selected_paths(self):
+        paths = []
+        for item in self.list.selectedItems():
+            info = self.infos.get(item.data(0, PATH_ROLE))
+            if info is not None and info.kind in ("file", "dir"):
+                paths.append(info.path)
+        return paths
+
+    def _update_pack_buttons(self):
+        info = self._current_info()
+        self.extract_button.setEnabled(
+            info is not None and info.kind == "file" and packer.can_extract(info.mime)
+        )
+        self.compress_button.setEnabled(bool(self._selected_paths()))
+
+    def extract_current(self):
+        info = self._fresh_current()
+        if info is None:
+            return
+        if info.kind != "file" or not packer.can_extract(info.mime):
+            self._show_message("このファイルは解凍できる形式ではありません")
+            return
+        password = None
+        while True:
+            result, error = run_job(
+                self, f"解凍しています：{info.name}",
+                lambda progress, cancel: packer.extract(info.path, info.mime, password, progress, cancel),
+            )
+            if isinstance(error, packer.PasswordNeeded):
+                dialog = PasswordDialog(info.name, wrong=error.wrong, parent=self)
+                if dialog.exec() != PasswordDialog.Accepted:
+                    self._show_message("解凍をやめました")
+                    return
+                password = dialog.password()
+                continue
+            break
+        if isinstance(error, packer.Cancelled):
+            self._show_message("解凍を中止しました（途中まで出したものは消しました）")
+            return
+        if error is not None:
+            self._report_error("解凍できませんでした。", error)
+            return
+        self._finish_pack(result, f"「{os.path.basename(result.path)}」に解凍しました")
+
+    def compress_selected(self):
+        paths = self._selected_paths()
+        if not paths:
+            return
+        if len({os.path.dirname(p.rstrip("/")) for p in paths}) != 1:
+            QMessageBox.warning(self, APP_NAME, "同じフォルダーにあるものだけ、まとめて圧縮できます。")
+            return
+        dialog = CompressDialog(paths, self)
+        if dialog.exec() != CompressDialog.Accepted:
+            return
+        opts = dialog.options()
+        result, error = run_job(
+            self, f"圧縮しています：{opts['name']}",
+            lambda progress, cancel: packer.create(paths, progress=progress, cancel=cancel, **opts),
+        )
+        if isinstance(error, packer.Cancelled):
+            self._show_message("圧縮を中止しました（作りかけのファイルは消しました）")
+            return
+        if error is not None:
+            self._report_error("圧縮できませんでした。", error)
+            return
+        self._finish_pack(result, f"「{os.path.basename(result.path)}」を作りました")
+
+    def _report_error(self, message, error):
+        if isinstance(error, packer.PackError):
+            QMessageBox.warning(self, APP_NAME, f"{message}\n{error}")
+        elif isinstance(error, OSError):
+            self._warn(message, error)
+        else:
+            QMessageBox.warning(self, APP_NAME, f"{message}\n思いがけない問題が起きました: {error!r}")
+
+    def _finish_pack(self, result, message):
+        self.add_paths([result.path])
+        if result.damaged:
+            message += f"（壊れていた {len(result.damaged)} 個を除く）"
+        self._show_message(message)
+        if result.damaged:
+            shown = "\n".join("・" + n for n in result.damaged[:15])
+            more = f"\nほか {len(result.damaged) - 15} 個" if len(result.damaged) > 15 else ""
+            QMessageBox.warning(
+                self, APP_NAME,
+                "圧縮ファイルの一部が壊れていました。\n"
+                f"無事なファイルは「{os.path.basename(result.path)}」に取り出しました。\n\n"
+                f"壊れていて取り出せなかったもの（{len(result.damaged)} 個）:\n{shown}{more}"
+                + (f"\n\n{result.note}" if result.note else "")
+                + "\n\n元の場所（スマホやクラウドなど）にまだ残っていれば、そこからもう一度取ってきてください。",
+            )
+            result.note = ""
+        notes = []
+        if result.note:
+            notes.append(result.note)
+        if result.skipped:
+            shown = "\n".join("・" + n for n in result.skipped[:10])
+            more = f"\nほか {len(result.skipped) - 10} 個" if len(result.skipped) > 10 else ""
+            notes.append(
+                f"安全のため、次の {len(result.skipped)} 個は入れていません"
+                "（シンボリックリンクや、外の場所を指す名前など）:\n" + shown + more
+            )
+        if notes:
+            QMessageBox.information(self, APP_NAME, message + "\n\n" + "\n\n".join(notes))
+
     # ---- 元に戻す ----
     def _update_undo_button(self):
         op = self.history.peek()
@@ -626,6 +749,7 @@ class MainWindow(QMainWindow):
         self.rename_button.setEnabled(usable)
         self.mode_button.setEnabled(usable and info.kind != "symlink")
         self.times_button.setEnabled(usable and info.kind != "symlink")
+        self._update_pack_buttons()
         f = self.fields
         if info is None:
             for label in f.values():

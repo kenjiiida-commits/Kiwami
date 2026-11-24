@@ -7,6 +7,8 @@ from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QWidget,
     QDateTimeEdit,
     QDialog,
     QDialogButtonBox,
@@ -201,3 +203,185 @@ class TimesDialog(QDialog):
 
     def times_ns(self):
         return self.atime.value_ns(), self.mtime.value_ns()
+
+
+# ------------------------------------------------------------------ 圧縮・解凍
+
+class PasswordDialog(QDialog):
+    """解凍のときのパスワード入力。"""
+
+    def __init__(self, archive_name, wrong=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("パスワード")
+        layout = QVBoxLayout(self)
+        title = QLabel(f"「{archive_name}」はパスワード付きです。")
+        title.setTextFormat(Qt.PlainText)
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        if wrong:
+            warn = QLabel("パスワードが違います。もう一度入力してください。")
+            warn.setStyleSheet("color: #c62828;")
+            layout.addWidget(warn)
+        self.edit = QLineEdit()
+        self.edit.setEchoMode(QLineEdit.Password)
+        self.edit.setMinimumWidth(300)
+        layout.addWidget(self.edit)
+        show = QCheckBox("パスワードを表示する")
+        show.toggled.connect(lambda on: self.edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
+        layout.addWidget(show)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("解凍")
+        buttons.button(QDialogButtonBox.Cancel).setText("やめる")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.ok = buttons.button(QDialogButtonBox.Ok)
+        self.ok.setEnabled(False)
+        self.edit.textChanged.connect(lambda t: self.ok.setEnabled(bool(t)))
+
+    def password(self):
+        return self.edit.text()
+
+
+class CompressDialog(QDialog):
+    """形式・名前・パスワードを決めて圧縮する。"""
+
+    def __init__(self, paths, parent=None):
+        from . import packer  # 循環を避けるためここで読む
+
+        super().__init__(parent)
+        self.packer = packer
+        self.paths = paths
+        self.setWindowTitle("圧縮")
+        layout = QVBoxLayout(self)
+        count = QLabel(
+            f"{os.path.basename(paths[0].rstrip('/'))} をまとめます" if len(paths) == 1
+            else f"選んだ {len(paths)} 個をまとめます"
+        )
+        count.setTextFormat(Qt.PlainText)
+        count.setStyleSheet("font-weight: bold;")
+        layout.addWidget(count)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("形式："), 0, 0)
+        self.fmt = QComboBox()
+        for key, (label, _, _) in packer.FORMATS.items():
+            self.fmt.addItem(label, key)
+        grid.addWidget(self.fmt, 0, 1)
+        grid.addWidget(QLabel("ファイル名："), 1, 0)
+        self.name = QLineEdit()
+        self.name.setMinimumWidth(320)
+        grid.addWidget(self.name, 1, 1)
+        layout.addLayout(grid)
+        where = QLabel(f"保存先：{os.path.dirname(paths[0].rstrip('/'))}（同じ名前があれば番号を付けます）")
+        where.setTextFormat(Qt.PlainText)
+        where.setWordWrap(True)
+        where.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(where)
+
+        self.use_pw = QCheckBox("パスワードを付ける")
+        layout.addWidget(self.use_pw)
+        self.pw_box = QWidget()
+        pw = QGridLayout(self.pw_box)
+        pw.setContentsMargins(20, 0, 0, 0)
+        pw.addWidget(QLabel("パスワード："), 0, 0)
+        self.pw1 = QLineEdit()
+        self.pw1.setEchoMode(QLineEdit.Password)
+        pw.addWidget(self.pw1, 0, 1)
+        pw.addWidget(QLabel("もう一度："), 1, 0)
+        self.pw2 = QLineEdit()
+        self.pw2.setEchoMode(QLineEdit.Password)
+        pw.addWidget(self.pw2, 1, 1)
+        self.show_pw = QCheckBox("パスワードを表示する")
+        self.show_pw.toggled.connect(self._toggle_show)
+        pw.addWidget(self.show_pw, 2, 1)
+        self.zip_method_label = QLabel("暗号の方式：")
+        pw.addWidget(self.zip_method_label, 3, 0)
+        self.zip_method = QComboBox()
+        self.zip_method.addItem("AES-256（安全。Windows の標準機能では開けず、7-Zip などが必要）", False)
+        self.zip_method.addItem("ZipCrypto（Windows の標準機能で開ける。ただし破られやすい）", True)
+        pw.addWidget(self.zip_method, 3, 1)
+        self.hide_names = QCheckBox("ファイル名も隠す（パスワードなしでは中身の一覧も見えない）")
+        pw.addWidget(self.hide_names, 4, 1)
+        layout.addWidget(self.pw_box)
+
+        self.error = QLabel("")
+        self.error.setTextFormat(Qt.PlainText)
+        self.error.setWordWrap(True)
+        self.error.setStyleSheet("color: #c62828;")
+        layout.addWidget(self.error)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok = buttons.button(QDialogButtonBox.Ok)
+        self.ok.setText("圧縮")
+        buttons.button(QDialogButtonBox.Cancel).setText("やめる")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._name_edited = False
+        self.name.textEdited.connect(lambda _: setattr(self, "_name_edited", True))
+        self.fmt.currentIndexChanged.connect(self._format_changed)
+        for w in (self.name, self.pw1, self.pw2):
+            w.textChanged.connect(self._validate)
+        self.use_pw.toggled.connect(self._update_pw)
+        self._format_changed()
+
+    def _toggle_show(self, on):
+        mode = QLineEdit.Normal if on else QLineEdit.Password
+        self.pw1.setEchoMode(mode)
+        self.pw2.setEchoMode(mode)
+
+    def _format_changed(self):
+        key = self.fmt.currentData()
+        ext = self.packer.FORMATS[key][1]
+        if not self._name_edited:
+            self.name.setText(self.packer.default_archive_name(self.paths, key))
+        else:
+            # 自分で付けた名前は残し、拡張子だけ付け替える
+            stem = self.name.text()
+            for k in self.packer.FORMATS.values():
+                if stem.lower().endswith("." + k[1]):
+                    stem = stem[: -len(k[1]) - 1]
+                    break
+            self.name.setText(f"{stem}.{ext}")
+        can_pw = self.packer.FORMATS[key][2]
+        self.use_pw.setEnabled(can_pw)
+        if not can_pw:
+            self.use_pw.setChecked(False)
+        self.use_pw.setToolTip("" if can_pw else "この形式はパスワードを付けられません（zip か 7z を選んでください）")
+        self._update_pw()
+
+    def _update_pw(self):
+        key = self.fmt.currentData()
+        self.pw_box.setVisible(self.use_pw.isChecked())
+        self.zip_method_label.setVisible(key == "zip")
+        self.zip_method.setVisible(key == "zip")
+        self.hide_names.setVisible(key == "7z")
+        self._validate()
+        self.adjustSize()
+
+    def _validate(self):
+        from .fileops import check_name
+
+        reason = check_name(self.name.text())
+        if not reason and self.use_pw.isChecked():
+            p1, p2 = self.pw1.text(), self.pw2.text()
+            if not p1:
+                reason = "パスワードを入力してください"
+            elif p1 != p2:
+                reason = "2つのパスワードが一致しません"
+            elif self.fmt.currentData() == "zip":
+                reason = self.packer.zip_password_problem(p1)
+        self.error.setText(reason)
+        self.ok.setEnabled(not reason)
+
+    def options(self):
+        use = self.use_pw.isChecked()
+        return {
+            "name": self.name.text(),
+            "fmt": self.fmt.currentData(),
+            "password": self.pw1.text() if use else None,
+            "zip_crypto": bool(self.zip_method.currentData()) if use else False,
+            "hide_names": self.hide_names.isChecked() if use else False,
+        }
