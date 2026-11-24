@@ -1,0 +1,37 @@
+.TH KIWAMI 1 "2026" "kiwami" "User Commands"
+.SH NAME
+kiwami \- small window that identifies file types and handles renaming, attributes, timestamps and archives
+.SH SYNOPSIS
+.B kiwami
+[\fB\-\-new\-window\fR] [\fIFILE\fR...]
+.SH DESCRIPTION
+.B kiwami
+(Japanese name: 極み窓) opens a small, always-on-top window. Drop files or folders onto it to see
+what a file really contains (detected from its content, not its name) and whether its extension matches.
+It can fix wrong extensions, rename files, change permissions and timestamps (with undo), show text,
+images, hex dumps and archive listings, and create or extract zip, 7z, tar.gz and tar.xz archives.
+.PP
+If kiwami is already running, the given files are added to the existing window.
+.SH OPTIONS
+.TP
+.B \-\-new\-window
+Always open a new window instead of passing the files to a running kiwami.
+.TP
+.B \-\-version
+Print the version and exit.
+.TP
+.B \-h, \-\-help
+Print a short usage message and exit.
+.SH FILES
+.TP
+.I ~/.config/kiwami/types.json
+User dictionary of file types (Japanese names, extensions, signatures).
+.TP
+.I ~/.local/share/kiwami/history.json
+Recently handled files.
+.SH SEE ALSO
+.BR file (1),
+.BR 7z (1),
+.BR unrar (1)
+.SH AUTHOR
+Kenji Iida (飯田顕治). Released under the MIT License.

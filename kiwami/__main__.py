@@ -15,6 +15,15 @@ def server_name():
 
 
 def main():
+    if "--version" in sys.argv[1:]:
+        from . import APP_NAME, __version__
+        print(f"{APP_NAME}（kiwami） {__version__}")
+        return 0
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        print("使い方: kiwami [--new-window] [ファイル ...]\n"
+              "  ファイルを渡すと、その判別結果を表示します。\n"
+              "  極み窓がすでに開いていれば、その窓に追加します（--new-window で新しい窓）。")
+        return 0
     # Ubuntu の標準画面（Wayland）では「常に最前面」が効かないため、
     # 互換モード（XWayland）で動かす。使えない環境では Wayland に戻る。
     if os.environ.get("WAYLAND_DISPLAY") and "QT_QPA_PLATFORM" not in os.environ:

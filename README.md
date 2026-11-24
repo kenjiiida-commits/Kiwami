@@ -97,7 +97,24 @@ sudo apt install 7zip unrar qt6-image-formats-plugins
 - `unrar`：rar の解凍に使います（Ubuntu の 7zip には rar を展開する部品が入っていないため）
 - `qt6-image-formats-plugins`：WebP・TIFF などの画像を表示できるようになります
 
-## アプリ一覧・右クリックへの登録（おすすめ）
+## DEB パッケージで入れる（おすすめ）
+
+対象は Ubuntu 25.04 以降です（Ubuntu 公式の PySide6 パッケージを使うため）。
+GitHub のリリースから `kiwami_<版>_all.deb` を取ってきて、次のように入れます。
+
+```bash
+sudo apt install ./kiwami_0.6.0_all.deb
+```
+
+- 必要なもの（PySide6・libmagic）は自動で入ります。7zip なども、おすすめとして一緒に入ります
+- rar を解凍するときは `sudo apt install unrar` も入れてください
+- アプリ一覧に「極み窓」が出ます。端末からは `kiwami` で起動できます
+- ファイル画面の右クリックに出したいときは、極み窓の「その他」→「ファイル画面の右クリックに登録する」
+- 外すときは `sudo apt remove kiwami`
+
+自分で DEB を作るときは `bash packaging/build-deb.sh`（`dist/` にできます）。
+
+## ソースのまま、アプリ一覧・右クリックに登録する
 
 ```bash
 cd ~/development/kiwami
@@ -107,6 +124,7 @@ bash install.sh
 - アプリ一覧に「極み窓」が出ます
 - ファイル画面（Nautilus）でファイルを右クリック →「スクリプト」→「極み窓で調べる」
 - 外すときは `bash uninstall.sh`
+- DEB で入れる場合は、先に `bash uninstall.sh` で外してください（アプリ一覧に2つ並ぶのを防ぐため）
 
 ## 起動
 

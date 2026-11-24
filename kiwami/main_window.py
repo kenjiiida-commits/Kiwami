@@ -35,7 +35,7 @@ from .detect import (
     inspect,
     name_with_extension,
 )
-from . import packer
+from . import nautilus, packer
 from .dialogs import (
     BulkFixDialog,
     CompressDialog,
@@ -263,6 +263,11 @@ class MainWindow(QMainWindow):
         more_button = QPushButton("その他")
         more_menu = QMenu(more_button)
         more_menu.addAction("自分用の辞書を開く…", self.open_user_dict)
+        self.nautilus_action = more_menu.addAction("ファイル画面の右クリックに登録する")
+        self.nautilus_action.setCheckable(True)
+        self.nautilus_action.setToolTip("右クリック →「スクリプト」→「極み窓で調べる」で開けるようにします")
+        self.nautilus_action.toggled.connect(self._toggle_nautilus)
+        more_menu.aboutToShow.connect(self._sync_nautilus_action)
         more_menu.addSeparator()
         more_menu.addAction("このソフトについて", self.show_about)
         more_button.setMenu(more_menu)
@@ -907,6 +912,27 @@ class MainWindow(QMainWindow):
             paths = dialog.selected_paths()
             if paths:
                 self.add_paths(paths)
+
+    def _sync_nautilus_action(self):
+        self.nautilus_action.blockSignals(True)
+        self.nautilus_action.setChecked(nautilus.is_installed())
+        self.nautilus_action.blockSignals(False)
+
+    def _toggle_nautilus(self, on):
+        try:
+            if on:
+                nautilus.install()
+                QMessageBox.information(
+                    self, APP_NAME,
+                    "登録しました。\nファイル画面でファイルを右クリック →「スクリプト」→"
+                    f"「{nautilus.SCRIPT_NAME}」で、極み窓に送れます。\n"
+                    "（メニューに出ないときは、ファイル画面を一度閉じて開き直してください）")
+            else:
+                nautilus.uninstall()
+                self._show_message("右クリックメニューから外しました")
+        except OSError as e:
+            self._warn("登録を変更できませんでした。", e)
+        self._sync_nautilus_action()
 
     def show_about(self):
         box = QMessageBox(self)
