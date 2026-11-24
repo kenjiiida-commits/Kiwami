@@ -73,12 +73,13 @@ class ModeDialog(QDialog):
     WHO = [("所有者", 6), ("グループ", 3), ("その他", 0)]
     WHAT = [("読み取り", 4), ("書き込み", 2), ("実行", 1)]
 
-    def __init__(self, info, parent=None):
+    def __init__(self, info, parent=None, count=1):
         super().__init__(parent)
         self.setWindowTitle("属性の変更")
         self._updating = False
         layout = QVBoxLayout(self)
-        title = QLabel(info.name)
+        title = QLabel(info.name if count == 1 else f"選んだ {count} 個をまとめて変更（最初の「{info.name}」の値を表示）")
+        title.setWordWrap(True)
         title.setTextFormat(Qt.PlainText)
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
@@ -176,11 +177,14 @@ class _TimeRow:
 
 
 class TimesDialog(QDialog):
-    def __init__(self, info, atime_ns, mtime_ns, parent=None):
+    def __init__(self, info, atime_ns, mtime_ns, parent=None, count=1):
         super().__init__(parent)
         self.setWindowTitle("日時の変更")
         layout = QVBoxLayout(self)
-        title = QLabel(info.name)
+        title = QLabel(info.name if count == 1 else
+                       f"選んだ {count} 個をまとめて変更（最初の「{info.name}」の値を表示。"
+                       "触らなかった方の日時は、それぞれのファイルのまま）")
+        title.setWordWrap(True)
         title.setTextFormat(Qt.PlainText)
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
@@ -203,6 +207,12 @@ class TimesDialog(QDialog):
 
     def times_ns(self):
         return self.atime.value_ns(), self.mtime.value_ns()
+
+    def changed_ns(self):
+        """変えた方だけ値を返し、触らなかった方は None。"""
+        a, m = self.times_ns()
+        return (None if a == self.atime.original_ns else a,
+                None if m == self.mtime.original_ns else m)
 
 
 # ------------------------------------------------------------------ 圧縮・解凍
@@ -385,3 +395,151 @@ class CompressDialog(QDialog):
             "zip_crypto": bool(self.zip_method.currentData()) if use else False,
             "hide_names": self.hide_names.isChecked() if use else False,
         }
+
+
+# ------------------------------------------------------------------ まとめて直す
+
+class BulkFixDialog(QDialog):
+    """拡張子をまとめて直す前に、変更の一覧を見せて確かめてもらう。"""
+
+    def __init__(self, plan, parent=None):
+        """plan: [(パス, 今の名前, 新しい名前, 中身の種類), ...]"""
+        from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+
+        super().__init__(parent)
+        self.setWindowTitle("拡張子をまとめて直す")
+        self.resize(640, 420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"次の {len(plan)} 個の拡張子を直します。直さないものはチェックを外してください。"))
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["今の名前", "新しい名前", "中身"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setColumnWidth(0, 220)
+        self.tree.setColumnWidth(1, 220)
+        for path, old, new, kind in plan:
+            item = QTreeWidgetItem([old, new, kind])
+            item.setCheckState(0, Qt.Checked)
+            item.setData(0, Qt.UserRole, path)
+            item.setToolTip(0, path)
+            self.tree.addTopLevelItem(item)
+        layout.addWidget(self.tree, 1)
+        note = QLabel("※ 同じ名前のファイルがすでにあるものは変更しません。あとで「元に戻す」でまとめて戻せます。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok = buttons.button(QDialogButtonBox.Ok)
+        self.ok.setText("直す")
+        buttons.button(QDialogButtonBox.Cancel).setText("やめる")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.tree.itemChanged.connect(lambda *_: self.ok.setEnabled(bool(self.chosen())))
+
+    def chosen(self):
+        result = []
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.checkState(0) == Qt.Checked:
+                result.append(item.data(0, Qt.UserRole))
+        return result
+
+
+# ------------------------------------------------------------------ 履歴
+
+class HistoryDialog(QDialog):
+    """最近扱ったファイルの一覧。選んだものを小窓の一覧に呼び戻せる。"""
+
+    def __init__(self, recent, keep_history, parent=None):
+        import time as _time
+
+        from PySide6.QtWidgets import QAbstractItemView, QTreeWidget, QTreeWidgetItem
+
+        super().__init__(parent)
+        self.recent = recent
+        self.setWindowTitle("履歴")
+        self.resize(640, 460)
+        layout = QVBoxLayout(self)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["名前", "場所", "扱った日時"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setColumnWidth(0, 200)
+        self.tree.setColumnWidth(1, 260)
+        for e in recent.entries:
+            path = e["path"]
+            exists = os.path.lexists(path)
+            item = QTreeWidgetItem([
+                os.path.basename(path.rstrip("/")) or path,
+                os.path.dirname(path.rstrip("/")),
+                _time.strftime("%Y-%m-%d %H:%M", _time.localtime(e["time"])) + ("" if exists else "（見つかりません）"),
+            ])
+            item.setData(0, Qt.UserRole, path)
+            item.setToolTip(0, path)
+            if not exists:
+                for col in range(3):
+                    item.setForeground(col, self.palette().placeholderText())
+            self.tree.addTopLevelItem(item)
+        self.tree.itemDoubleClicked.connect(lambda *_: self.accept())
+        layout.addWidget(self.tree, 1)
+        if not recent.entries:
+            layout.addWidget(QLabel("履歴はまだありません。"))
+
+        row = QHBoxLayout()
+        remove = QPushButton("履歴から外す")
+        remove.clicked.connect(self._remove_selected)
+        clear = QPushButton("すべて消す")
+        clear.clicked.connect(self._clear)
+        row.addWidget(remove)
+        row.addWidget(clear)
+        row.addStretch(1)
+        self.keep = QCheckBox("履歴を残す")
+        self.keep.setChecked(keep_history)
+        row.addWidget(self.keep)
+        layout.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Close)
+        self.ok = buttons.button(QDialogButtonBox.Ok)
+        self.ok.setText("一覧に追加")
+        buttons.button(QDialogButtonBox.Close).setText("閉じる")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.tree.itemSelectionChanged.connect(self._update)
+        self._update()
+
+    def _update(self):
+        self.ok.setEnabled(bool(self.tree.selectedItems()))
+
+    def _remove_selected(self):
+        paths = [i.data(0, Qt.UserRole) for i in self.tree.selectedItems()]
+        self.recent.remove(paths)
+        for item in self.tree.selectedItems():
+            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
+
+    def _clear(self):
+        self.recent.clear()
+        self.tree.clear()
+
+    def selected_paths(self):
+        return [i.data(0, Qt.UserRole) for i in self.tree.selectedItems()
+                if os.path.lexists(i.data(0, Qt.UserRole))]
+
+    def keep_history(self):
+        return self.keep.isChecked()
+
+
+# ------------------------------------------------------------------ このソフトについて
+
+def about_text():
+    from . import APP_NAME, __version__
+
+    return (
+        f"<h3>{APP_NAME}（Kiwami） Ver.{__version__}</h3>"
+        "<p>小さな窓にファイルをドロップするだけで、中身の本当の種類を見分けたり、"
+        "名前・属性・日時の変更、中身の表示、圧縮・解凍ができる Ubuntu 用ソフトです。</p>"
+        "<p>Windows 用のフリーソフト「極窓」（NTSOFT）の使い心地を目標にした、"
+        "別の作者による新しいソフトです。元の極窓とは関係ありません。</p>"
+        "<p>作者：飯田顕治<br>ライセンス：MIT<br>"
+        "<a href='https://github.com/kenjiiida-commits/Kiwami'>https://github.com/kenjiiida-commits/Kiwami</a></p>"
+    )

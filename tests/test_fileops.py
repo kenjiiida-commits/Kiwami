@@ -4,7 +4,11 @@ import tempfile
 import unittest
 
 from kiwami.fileops import (
+    GroupOp,
     History,
+    bulk_change_extensions,
+    bulk_set_mode,
+    bulk_set_times,
     UndoConflict,
     UndoError,
     change_extension,
@@ -215,6 +219,80 @@ class HistoryTest(Base):
         h.undo()  # フォルダー名を戻す
         h.undo()  # 属性を戻す
         self.assertEqual(stat.S_IMODE(os.stat(inner).st_mode), 0o644)
+
+
+class GroupTest(Base):
+    def test_bulk_extensions_and_undo(self):
+        h = History()
+        a = self._touch("a.jpg", b"1")
+        b = self._touch("b", b"2")
+        c = self._touch("c.jpg", b"3")
+        self._touch("c.png", b"taken")  # c は名前がぶつかる
+        group, moved, failed = bulk_change_extensions([(a, "png"), (b, "zip"), (c, "png")])
+        self.assertEqual(sorted(os.path.basename(p) for p in moved.values()), ["a.png", "b.zip"])
+        self.assertEqual([os.path.basename(p) for p, _ in failed], ["c.jpg"])
+        h.push(group)
+        op, done = h.undo()
+        self.assertIs(op, group)
+        self.assertEqual(len(done), 2)
+        self.assertTrue(os.path.exists(a) and os.path.exists(b))
+        self.assertEqual(self._read(os.path.join(self.dir, "c.png")), b"taken")
+
+    def test_group_conflict_changes_nothing(self):
+        h = History()
+        paths = [self._touch(n) for n in ("x", "y")]
+        for p in paths:
+            os.chmod(p, 0o644)
+        group, failed = bulk_set_mode(paths, 0o600)
+        self.assertEqual(failed, [])
+        h.push(group)
+        os.chmod(paths[1], 0o640)  # 片方だけ別のソフトが変えた
+        with self.assertRaises(UndoConflict):
+            h.undo()
+        # 何も戻していない（中途半端にしない）
+        self.assertEqual(stat.S_IMODE(os.stat(paths[0]).st_mode), 0o600)
+        h.undo(force=True)
+        self.assertEqual([stat.S_IMODE(os.stat(p).st_mode) for p in paths], [0o644, 0o644])
+
+    def test_group_partial_failure_is_reported(self):
+        h = History()
+        paths = [self._touch(n) for n in ("p", "q")]
+        group, _ = bulk_set_mode(paths, 0o600)
+        h.push(group)
+        os.remove(paths[0])
+        _, done = h.undo()
+        self.assertEqual(len(done), 1)
+        self.assertEqual(len(group.errors), 1)
+
+    def test_bulk_times_keeps_untouched_value(self):
+        p1, p2 = self._touch("1"), self._touch("2")
+        os.utime(p1, ns=(5 * NS, 10 * NS))
+        os.utime(p2, ns=(6 * NS, 20 * NS))
+        group, failed = bulk_set_times([p1, p2], mtime_ns=99 * NS)
+        self.assertEqual([os.stat(p).st_mtime_ns for p in (p1, p2)], [99 * NS, 99 * NS])
+        self.assertEqual([os.stat(p).st_atime_ns for p in (p1, p2)], [5 * NS, 6 * NS])
+        group.undo()
+        self.assertEqual([os.stat(p).st_mtime_ns for p in (p1, p2)], [10 * NS, 20 * NS])
+
+    def test_folder_rename_inside_group_relocates(self):
+        h = History()
+        folder = os.path.join(self.dir, "旧")
+        os.mkdir(folder)
+        inner = os.path.join(folder, "a.jpg")
+        with open(inner, "wb") as f:
+            f.write(b"x")
+        group, moved, _ = bulk_change_extensions([(inner, "png")])
+        h.push(group)
+        _, op = rename(folder, "新")
+        h.push(op)
+        h.undo()
+        h.undo()
+        self.assertTrue(os.path.exists(inner))
+
+    def test_empty_group_is_not_recorded(self):
+        h = History()
+        h.push(GroupOp("なにもしない", []))
+        self.assertEqual(len(h), 0)
 
 
 if __name__ == "__main__":

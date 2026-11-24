@@ -2,8 +2,8 @@
 
 import os
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QKeySequence
+from PySide6.QtCore import QItemSelectionModel, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QMenu,
@@ -36,10 +36,23 @@ from .detect import (
     name_with_extension,
 )
 from . import packer
-from .dialogs import CompressDialog, ModeDialog, PasswordDialog, RenameDialog, TimesDialog
+from .dialogs import (
+    BulkFixDialog,
+    CompressDialog,
+    HistoryDialog,
+    ModeDialog,
+    PasswordDialog,
+    RenameDialog,
+    TimesDialog,
+    about_text,
+)
 from .fileops import (
+    GroupOp,
     History,
     RenameOp,
+    bulk_change_extensions,
+    bulk_set_mode,
+    bulk_set_times,
     UndoConflict,
     UndoError,
     change_extension,
@@ -49,10 +62,14 @@ from .fileops import (
     set_times,
 )
 from .jobs import run_job
+from .recent import RecentFiles
 from .typesdb import TypeDB
 from .viewer import ViewerWindow
 
 PATH_ROLE = Qt.UserRole
+ICON_PATH = os.path.join(os.path.dirname(__file__), "data", "kiwami.svg")
+MANY = 100  # これより多いときは、進み具合の窓を出して裏で調べる
+FOLDER_LIMIT = 20000  # フォルダーの中身を一覧に入れる上限
 
 RED = "#c62828"
 AMBER = "#9a6700"
@@ -120,7 +137,11 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("kenjiiida", "kiwami")
         self.db = TypeDB()
         self.infos = {}  # path -> FileInfo
+        self.items = {}  # path -> 一覧の行
         self.history = History()
+        self.recent = RecentFiles()
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -172,9 +193,16 @@ class MainWindow(QMainWindow):
         self.compress_button = QPushButton("圧縮する…")
         self.compress_button.setToolTip("一覧で選んだもの（Ctrl や Shift で複数選べます）をまとめます")
         self.compress_button.clicked.connect(self.compress_selected)
+        self.bulk_fix_button = QPushButton()
+        self.bulk_fix_button.setToolTip(
+            "拡張子が中身と違うもの・拡張子がないものを、確認してからまとめて直します\n"
+            "（複数選んでいれば選んだものだけ、そうでなければ一覧の全部が対象）"
+        )
+        self.bulk_fix_button.clicked.connect(self.bulk_fix)
         pack.addWidget(self.extract_button)
         pack.addWidget(self.compress_button)
         pack.addStretch(1)
+        pack.addWidget(self.bulk_fix_button)
         layout.addLayout(pack)
         self.list.itemSelectionChanged.connect(self._update_pack_buttons)
 
@@ -229,15 +257,22 @@ class MainWindow(QMainWindow):
         open_button.clicked.connect(self.open_dialog)
         clear_button = QPushButton("クリア")
         clear_button.clicked.connect(self.clear)
-        dict_button = QPushButton("辞書…")
-        dict_button.setToolTip("自分用の辞書（形式の追加・日本語名の変更）を開きます")
-        dict_button.clicked.connect(self.open_user_dict)
+        history_button = QPushButton("履歴…")
+        history_button.setToolTip("最近扱ったファイルを一覧に呼び戻します")
+        history_button.clicked.connect(self.show_history)
+        more_button = QPushButton("その他")
+        more_menu = QMenu(more_button)
+        more_menu.addAction("自分用の辞書を開く…", self.open_user_dict)
+        more_menu.addSeparator()
+        more_menu.addAction("このソフトについて", self.show_about)
+        more_button.setMenu(more_menu)
         self.on_top = QCheckBox("常に最前面")
         self.on_top.setChecked(self.settings.value("on_top", True, type=bool))
         self.on_top.toggled.connect(self._set_on_top)
         bottom.addWidget(open_button)
         bottom.addWidget(clear_button)
-        bottom.addWidget(dict_button)
+        bottom.addWidget(history_button)
+        bottom.addWidget(more_button)
         bottom.addStretch(1)
         bottom.addWidget(self.on_top)
         layout.addLayout(bottom)
@@ -248,6 +283,7 @@ class MainWindow(QMainWindow):
             (QKeySequence.Open, self.open_dialog),
             (QKeySequence(Qt.Key_F2), self.rename_current),
             (QKeySequence.Undo, self.undo),
+            (QKeySequence(Qt.Key_Delete), self.remove_selected),
         ):
             action = QAction(self)
             action.setShortcut(keys)
@@ -258,8 +294,9 @@ class MainWindow(QMainWindow):
         if geometry is not None:
             self.restoreGeometry(geometry)
         else:
-            self.resize(460, 560)
+            self.resize(470, 660)
         self._apply_on_top(self.on_top.isChecked())
+        self.list.itemSelectionChanged.connect(self._update_selection_buttons)
         self._show_info(None)
         self._update_undo_button()
         self._report_dict_error()
@@ -317,15 +354,60 @@ class MainWindow(QMainWindow):
         if paths:
             self.add_paths(paths)
 
-    def add_paths(self, paths):
+    def add_paths(self, paths, remember=True):
         self._reload_dict()
+        paths = [p for p in dict.fromkeys(os.path.abspath(p) for p in paths)]
+        if len(paths) > MANY:
+            def work(progress, cancel):
+                infos = []
+                for i, p in enumerate(paths):
+                    if cancel.is_set():
+                        break
+                    infos.append(inspect(p, self.db))
+                    if i % 20 == 0:
+                        progress(i / len(paths), os.path.basename(p))
+                return infos
+            infos, error = run_job(self, f"{len(paths):,} 個を調べています", work)
+            if error is not None:
+                self._report_error("調べられませんでした。", error)
+                return
+        else:
+            infos = [inspect(p, self.db) for p in paths]
+        if not infos:
+            return
+        self.list.setUpdatesEnabled(False)
         last_item = None
-        for p in paths:
-            last_item = self._set_info(inspect(p, self.db))
-        if last_item is not None:
-            self.stack.setCurrentWidget(self.list)
-            self.list.setCurrentItem(last_item)
-            self._show_info(self.infos[last_item.data(0, PATH_ROLE)])
+        for info in infos:
+            last_item = self._set_info(info)
+        self.list.setUpdatesEnabled(True)
+        if remember and self.settings.value("keep_history", True, type=bool):
+            self.recent.add([i.path for i in infos])
+        self.stack.setCurrentWidget(self.list)
+        self.list.setCurrentItem(last_item)
+        self._show_info(self.infos[last_item.data(0, PATH_ROLE)])
+        self._update_selection_buttons()
+        if len(infos) < len(paths):
+            self._show_message(f"中止したため、{len(infos):,} 個だけ一覧に入れました")
+
+    def add_folder_contents(self, folder):
+        """フォルダーの中のファイル（サブフォルダーの中も）を一覧に入れる。"""
+        found = []
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(root, d)))
+            for f in sorted(files):
+                found.append(os.path.join(root, f))
+                if len(found) >= FOLDER_LIMIT:
+                    break
+            if len(found) >= FOLDER_LIMIT:
+                break
+        if not found:
+            self._show_message("このフォルダーにはファイルがありません")
+            return
+        if len(found) >= FOLDER_LIMIT:
+            QMessageBox.information(
+                self, APP_NAME, f"ファイルが多いため、最初の {FOLDER_LIMIT:,} 個だけ一覧に入れます。")
+        self.add_paths(found, remember=False)
+        self._show_message(f"「{os.path.basename(folder)}」の中の {len(found):,} 個を一覧に入れました")
 
     def _set_info(self, info, old_path=None):
         """一覧の行を作るか更新して、その行を返す。"""
@@ -336,10 +418,12 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(self.list)
         if old_path:
             self.infos.pop(old_path, None)
+            self.items.pop(old_path, None)
             # 新しい名前の行が別にあれば（古い情報なので）消す
             other = self._find_item(info.path)
             if other is not None and other is not item:
                 self.list.takeTopLevelItem(self.list.indexOfTopLevelItem(other))
+        self.items[info.path] = item
         item.setData(0, PATH_ROLE, info.path)
         item.setText(0, info.name)
         item.setText(1, _short_type(info))
@@ -358,15 +442,12 @@ class MainWindow(QMainWindow):
         self._show_current(self.list.currentItem(), None)
 
     def _find_item(self, path):
-        for i in range(self.list.topLevelItemCount()):
-            item = self.list.topLevelItem(i)
-            if item.data(0, PATH_ROLE) == path:
-                return item
-        return None
+        return self.items.get(path)
 
     def clear(self):
         self.list.clear()
         self.infos.clear()
+        self.items.clear()
         self.stack.setCurrentIndex(0)
         self._show_info(None)
 
@@ -450,52 +531,113 @@ class MainWindow(QMainWindow):
         self._path_changed(info.path, new_path)
         self._show_message(f"「{info.name}」→「{os.path.basename(new_path)}」に変更しました")
 
-    def change_mode_current(self):
+    def _targets(self):
+        """属性・日時を変える対象。複数選んでいれば選んだもの全部、そうでなければ今の行。"""
+        selected = [self.infos.get(i.data(0, PATH_ROLE)) for i in self.list.selectedItems()]
+        selected = [i for i in selected if i is not None and i.kind in ("file", "dir")]
+        if len(selected) > 1:
+            fresh = [inspect(i.path, self.db) for i in selected]
+            return [i for i in fresh if i.kind in ("file", "dir")]
         info = self._fresh_current()
-        if info is None:
+        return [info] if info is not None else []
+
+    def _report_failures(self, title, failed):
+        if not failed:
             return
-        if info.kind == "symlink":
+        shown = "\n".join(f"・{os.path.basename(p)}：{why}" for p, why in failed[:15])
+        more = f"\nほか {len(failed) - 15} 個" if len(failed) > 15 else ""
+        QMessageBox.warning(self, APP_NAME, f"{title}\n次の {len(failed)} 個は変更できませんでした:\n{shown}{more}")
+
+    def change_mode_current(self):
+        targets = self._targets()
+        if not targets:
+            return
+        if any(t.kind == "symlink" for t in targets):
             self._show_message("シンボリックリンクの属性は変更できません")
             return
-        dialog = ModeDialog(info, self)
+        dialog = ModeDialog(targets[0], self, count=len(targets))
         if dialog.exec() != ModeDialog.Accepted:
             return
-        try:
-            op = set_mode(info.path, dialog.mode())
-        except (OSError, ValueError) as e:
-            self._warn("属性を変更できませんでした。", e)
+        if len(targets) == 1:
+            try:
+                op = set_mode(targets[0].path, dialog.mode())
+            except (OSError, ValueError) as e:
+                self._warn("属性を変更できませんでした。", e)
+                return
+            if op is None:
+                return
+            self.history.push(op)
+            self._refresh_path(targets[0].path)
+            self._show_message(f"属性を {format_mode(op.new_mode)} にしました")
             return
-        if op is None:
-            return
-        self.history.push(op)
-        self._refresh_path(info.path)
-        self._show_message(f"属性を {format_mode(op.new_mode)} にしました")
+        group, failed = bulk_set_mode([t.path for t in targets], dialog.mode())
+        self.history.push(group)
+        self._refresh_paths([t.path for t in targets])
+        self._show_message(f"{len(group.ops)} 個の属性を {format_mode(dialog.mode())} にしました")
+        self._report_failures("属性をまとめて変更しました。", failed)
 
     def change_times_current(self):
-        info = self._fresh_current()
-        if info is None:
+        targets = self._targets()
+        if not targets:
             return
-        if info.kind == "symlink":
-            self._show_message("シンボリックリンクの日時は変更できません")
-            return
+        first = targets[0]
         try:
-            st = os.lstat(info.path)
+            st = os.lstat(first.path)
         except OSError as e:
             self._warn("日時を読み取れませんでした。", e)
             return
-        dialog = TimesDialog(info, st.st_atime_ns, st.st_mtime_ns, self)
+        dialog = TimesDialog(first, st.st_atime_ns, st.st_mtime_ns, self, count=len(targets))
         if dialog.exec() != TimesDialog.Accepted:
             return
-        try:
-            op = set_times(info.path, *dialog.times_ns())
-        except (OSError, ValueError, OverflowError) as e:
-            self._warn("日時を変更できませんでした。", e)
+        if len(targets) == 1:
+            try:
+                op = set_times(first.path, *dialog.times_ns())
+            except (OSError, ValueError, OverflowError) as e:
+                self._warn("日時を変更できませんでした。", e)
+                return
+            if op is None:
+                return
+            self.history.push(op)
+            self._refresh_path(first.path)
+            self._show_message("日時を変更しました")
             return
-        if op is None:
+        atime, mtime = dialog.changed_ns()
+        if atime is None and mtime is None:
             return
-        self.history.push(op)
-        self._refresh_path(info.path)
-        self._show_message("日時を変更しました")
+        group, failed = bulk_set_times([t.path for t in targets], atime, mtime)
+        self.history.push(group)
+        self._refresh_paths([t.path for t in targets])
+        self._show_message(f"{len(group.ops)} 個の日時を変更しました")
+        self._report_failures("日時をまとめて変更しました。", failed)
+
+    # ---- 拡張子をまとめて直す ----
+    def _bulk_candidates(self):
+        selected = [self.infos.get(i.data(0, PATH_ROLE)) for i in self.list.selectedItems()]
+        pool = selected if len(selected) > 1 else list(self.infos.values())
+        return [i for i in pool if i is not None and i.status in (MISMATCH, NOEXT) and i.suggestions
+                and i.suggestions[0] != ""]
+
+    def bulk_fix(self):
+        self._reload_dict()
+        fresh = [inspect(i.path, self.db) for i in self._bulk_candidates()]
+        fresh = [i for i in fresh if i.status in (MISMATCH, NOEXT) and i.suggestions and i.suggestions[0]]
+        if not fresh:
+            self._refresh_paths([i.path for i in self._bulk_candidates()])
+            self._show_message("直すものはありません")
+            return
+        plan = [(i.path, i.name, name_with_extension(i.name, i.suggestions[0]), i.type_name) for i in fresh]
+        dialog = BulkFixDialog(plan, self)
+        if dialog.exec() != BulkFixDialog.Accepted:
+            return
+        chosen = set(dialog.chosen())
+        group, moved, failed = bulk_change_extensions(
+            [(i.path, i.suggestions[0]) for i in fresh if i.path in chosen])
+        self.history.push(group)
+        for old, new in moved.items():
+            self._path_changed(old, new, select=False)
+        self._update_selection_buttons()
+        self._show_message(f"{len(moved)} 個の拡張子を直しました（「元に戻す」でまとめて戻せます）")
+        self._report_failures(f"{len(moved)} 個の拡張子を直しました。", failed)
 
     # ---- 中身を見る ----
     def view_current(self):
@@ -648,15 +790,26 @@ class MainWindow(QMainWindow):
             self._warn("元に戻せませんでした。", e)
             self._update_undo_button()
             return
-        if isinstance(op, RenameOp):
+        if isinstance(op, GroupOp):
+            for sub, sub_path in path:
+                if isinstance(sub, RenameOp):
+                    self._path_changed(sub.new_path, sub.old_path, select=False)
+                else:
+                    self._refresh_paths([sub_path])
+            self._update_selection_buttons()
+            if op.errors:
+                shown = "\n".join("・" + e for e in op.errors[:15])
+                QMessageBox.warning(self, APP_NAME, f"一部は元に戻せませんでした:\n{shown}")
+        elif isinstance(op, RenameOp):
             self._path_changed(op.new_path, op.old_path)
         else:
             self._refresh_path(path)
         self._show_message(f"元に戻しました：{op.describe()}")
 
     # ---- 一覧の更新 ----
-    def _path_changed(self, old, new):
+    def _path_changed(self, old, new, select=True):
         """名前が変わったファイル（フォルダーなら中のファイルも）の行を付け替える。"""
+        self.recent.rename(old, new)
         old_prefix = old.rstrip("/") + "/"
         current = None
         for path in list(self.infos):
@@ -669,9 +822,19 @@ class MainWindow(QMainWindow):
             item = self._set_info(inspect(moved, self.db), old_path=path)
             if path == old:
                 current = item
-        if current is not None:
+        if current is not None and select:
             self.list.setCurrentItem(current)
             self._show_info(self.infos[new])
+        elif self.list.currentItem() is not None:
+            self._show_current(self.list.currentItem(), None)
+        self._update_undo_button()
+        self._update_selection_buttons()
+
+    def _refresh_paths(self, paths):
+        for path in paths:
+            if path in self.infos:
+                self._set_info(inspect(path, self.db))
+        self._show_current(self.list.currentItem(), None)
         self._update_undo_button()
 
     def _refresh_path(self, path):
@@ -685,7 +848,11 @@ class MainWindow(QMainWindow):
         item = self.list.itemAt(pos)
         if item is None:
             return
-        self.list.setCurrentItem(item)
+        if not item.isSelected():
+            self.list.setCurrentItem(item)
+        else:
+            # 複数選んだままにする
+            self.list.setCurrentItem(item, 0, QItemSelectionModel.NoUpdate)
         info = self._current_info()
         menu = QMenu(self)
         view_action = menu.addAction("中身を見る", self.view_current)
@@ -697,16 +864,66 @@ class MainWindow(QMainWindow):
         if info is not None and info.kind in ("symlink", "missing"):
             mode_action.setEnabled(False)
             times_action.setEnabled(False)
+        if info is not None and info.kind == "dir":
+            menu.addAction("フォルダーの中身を一覧に入れる", lambda: self.add_folder_contents(info.path))
         menu.addSeparator()
-        menu.addAction("一覧から外す", lambda: self._remove_item(item))
+        menu.addAction("一覧から外す（Delete）", self.remove_selected)
         menu.exec(self.list.viewport().mapToGlobal(pos))
 
     def _remove_item(self, item):
         path = item.data(0, PATH_ROLE)
         self.infos.pop(path, None)
+        self.items.pop(path, None)
         self.list.takeTopLevelItem(self.list.indexOfTopLevelItem(item))
         if not self.infos:
             self.clear()
+
+    def remove_selected(self):
+        for item in list(self.list.selectedItems()):
+            self._remove_item(item)
+        self._update_selection_buttons()
+
+    def _update_selection_buttons(self):
+        """複数選んだときのボタンの文字と、まとめて直すボタンの表示。"""
+        count = len([i for i in self.list.selectedItems()])
+        multi = count > 1
+        self.rename_button.setEnabled(not multi and self._current_info() is not None
+                                      and self._current_info().kind != "missing")
+        self.mode_button.setText(f"属性（{count}）" if multi else "属性")
+        self.times_button.setText(f"日時（{count}）" if multi else "日時")
+        n = len(self._bulk_candidates())
+        self.bulk_fix_button.setText(f"拡張子をまとめて直す（{n}）")
+        self.bulk_fix_button.setVisible(n > 1 or (n == 1 and multi))
+        self._update_pack_buttons()
+
+    # ---- 履歴・情報 ----
+    def show_history(self):
+        dialog = HistoryDialog(self.recent, self.settings.value("keep_history", True, type=bool), self)
+        accepted = dialog.exec() == HistoryDialog.Accepted
+        self.settings.setValue("keep_history", dialog.keep_history())
+        if not dialog.keep_history():
+            self.recent.clear()
+        if accepted:
+            paths = dialog.selected_paths()
+            if paths:
+                self.add_paths(paths)
+
+    def show_about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle(f"{APP_NAME}について")
+        box.setTextFormat(Qt.RichText)
+        box.setText(about_text())
+        box.setTextInteractionFlags(Qt.TextBrowserInteraction)  # リンクを押せるように
+        if os.path.exists(ICON_PATH):
+            box.setIconPixmap(QIcon(ICON_PATH).pixmap(64, 64))
+        box.exec()
+
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _show_message(self, text):
         self.statusBar().setStyleSheet("")
@@ -749,7 +966,7 @@ class MainWindow(QMainWindow):
         self.rename_button.setEnabled(usable)
         self.mode_button.setEnabled(usable and info.kind != "symlink")
         self.times_button.setEnabled(usable and info.kind != "symlink")
-        self._update_pack_buttons()
+        self._update_selection_buttons()
         f = self.fields
         if info is None:
             for label in f.values():
