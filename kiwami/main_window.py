@@ -2,10 +2,11 @@
 
 import os
 
-from PySide6.QtCore import QSettings, Qt, QUrl
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
+    QMenu,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -34,8 +35,20 @@ from .detect import (
     inspect,
     name_with_extension,
 )
-from .fileops import change_extension
+from .dialogs import ModeDialog, RenameDialog, TimesDialog
+from .fileops import (
+    History,
+    RenameOp,
+    UndoConflict,
+    UndoError,
+    change_extension,
+    format_mode,
+    rename,
+    set_mode,
+    set_times,
+)
 from .typesdb import TypeDB
+from .viewer import ViewerWindow
 
 PATH_ROLE = Qt.UserRole
 
@@ -105,6 +118,7 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("kenjiiida", "kiwami")
         self.db = TypeDB()
         self.infos = {}  # path -> FileInfo
+        self.history = History()
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -119,8 +133,33 @@ class MainWindow(QMainWindow):
         self.list.setAlternatingRowColors(True)
         self.list.setColumnWidth(0, 200)
         self.list.currentItemChanged.connect(self._show_current)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context_menu)
+        self.list.itemDoubleClicked.connect(lambda *_: self.view_current())
         self.stack.addWidget(self.list)
         layout.addWidget(self.stack, 1)
+
+        # 変更操作の列
+        ops = QHBoxLayout()
+        self.rename_button = QPushButton("名前変更")
+        self.rename_button.setToolTip("名前を変える（F2）")
+        self.rename_button.clicked.connect(self.rename_current)
+        self.mode_button = QPushButton("属性")
+        self.mode_button.setToolTip("読み書きなどの許可（パーミッション）を変える")
+        self.mode_button.clicked.connect(self.change_mode_current)
+        self.times_button = QPushButton("日時")
+        self.times_button.setToolTip("更新日時・アクセス日時を変える")
+        self.times_button.clicked.connect(self.change_times_current)
+        self.view_button = QPushButton("中身を見る")
+        self.view_button.setToolTip("テキスト・画像・16進・圧縮ファイルの中身を表示（ダブルクリックでも可）")
+        self.view_button.clicked.connect(self.view_current)
+        self.undo_button = QPushButton("元に戻す")
+        self.undo_button.clicked.connect(self.undo)
+        for b in (self.view_button, self.rename_button, self.mode_button, self.times_button):
+            ops.addWidget(b)
+        ops.addStretch(1)
+        ops.addWidget(self.undo_button)
+        layout.addLayout(ops)
 
         # 判定の帯
         self.banner = QLabel()
@@ -151,6 +190,7 @@ class MainWindow(QMainWindow):
             ("folder", "場所"),
             ("size", "大きさ"),
             ("mtime", "更新日時"),
+            ("mode", "属性"),
             ("type", "中身の種類"),
             ("description", "詳しい説明"),
             ("mime", "MIME"),
@@ -187,10 +227,15 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        open_action = QAction(self)
-        open_action.setShortcut(QKeySequence.Open)
-        open_action.triggered.connect(self.open_dialog)
-        self.addAction(open_action)
+        for keys, slot in (
+            (QKeySequence.Open, self.open_dialog),
+            (QKeySequence(Qt.Key_F2), self.rename_current),
+            (QKeySequence.Undo, self.undo),
+        ):
+            action = QAction(self)
+            action.setShortcut(keys)
+            action.triggered.connect(slot)
+            self.addAction(action)
 
         geometry = self.settings.value("geometry")
         if geometry is not None:
@@ -199,6 +244,7 @@ class MainWindow(QMainWindow):
             self.resize(460, 560)
         self._apply_on_top(self.on_top.isChecked())
         self._show_info(None)
+        self._update_undo_button()
         self._report_dict_error()
 
     # ---- 常に最前面 ----
@@ -273,6 +319,10 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(self.list)
         if old_path:
             self.infos.pop(old_path, None)
+            # 新しい名前の行が別にあれば（古い情報なので）消す
+            other = self._find_item(info.path)
+            if other is not None and other is not item:
+                self.list.takeTopLevelItem(self.list.indexOfTopLevelItem(other))
         item.setData(0, PATH_ROLE, info.path)
         item.setText(0, info.name)
         item.setText(1, _short_type(info))
@@ -323,7 +373,7 @@ class MainWindow(QMainWindow):
             self._show_message("ファイルの状態が変わっていたため、判定し直しました")
             return
         try:
-            new_path = change_extension(fresh.path, new_ext)
+            new_path, op = change_extension(fresh.path, new_ext)
         except FileExistsError:
             QMessageBox.warning(
                 self,
@@ -333,14 +383,207 @@ class MainWindow(QMainWindow):
             )
             return
         except (OSError, ValueError) as e:
-            reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
-            QMessageBox.warning(self, APP_NAME, f"名前を変更できませんでした。\n{reason}")
+            self._warn("名前を変更できませんでした。", e)
             return
-        new_info = inspect(new_path, self.db)
-        item = self._set_info(new_info, old_path=fresh.path)
+        self.history.push(op)
+        self._path_changed(fresh.path, new_path)
+        self._show_message(f"「{fresh.name}」→「{os.path.basename(new_path)}」に変更しました")
+
+    # ---- 名前・属性・日時の変更 ----
+    def _fresh_current(self):
+        """選んでいるファイルを調べ直して返す。見つからなければ知らせて None。"""
+        info = self._current_info()
+        if info is None:
+            return None
+        fresh = inspect(info.path, self.db)
+        if fresh.kind == "missing":
+            self._set_info(fresh)
+            self._show_info(fresh)
+            self._show_message("ファイルが見つかりません（移動または削除されたようです）")
+            return None
+        return fresh
+
+    def _warn(self, message, error):
+        if isinstance(error, PermissionError):
+            reason = "権限がありません（自分が所有者でない、または書き込み禁止の場所です）"
+        elif isinstance(error, OSError) and error.strerror:
+            reason = error.strerror
+        else:
+            reason = str(error)
+        QMessageBox.warning(self, APP_NAME, f"{message}\n{reason}")
+
+    def rename_current(self):
+        info = self._fresh_current()
+        if info is None:
+            return
+        dialog = RenameDialog(info.path, self)
+        if dialog.exec() != RenameDialog.Accepted:
+            return
+        try:
+            new_path, op = rename(info.path, dialog.new_name())
+        except FileExistsError:
+            QMessageBox.warning(self, APP_NAME, "同じ名前のファイルがすでにあるため、変更しませんでした。")
+            return
+        except (OSError, ValueError) as e:
+            self._warn("名前を変更できませんでした。", e)
+            return
+        if op is None:
+            return
+        self.history.push(op)
+        self._path_changed(info.path, new_path)
+        self._show_message(f"「{info.name}」→「{os.path.basename(new_path)}」に変更しました")
+
+    def change_mode_current(self):
+        info = self._fresh_current()
+        if info is None:
+            return
+        if info.kind == "symlink":
+            self._show_message("シンボリックリンクの属性は変更できません")
+            return
+        dialog = ModeDialog(info, self)
+        if dialog.exec() != ModeDialog.Accepted:
+            return
+        try:
+            op = set_mode(info.path, dialog.mode())
+        except (OSError, ValueError) as e:
+            self._warn("属性を変更できませんでした。", e)
+            return
+        if op is None:
+            return
+        self.history.push(op)
+        self._refresh_path(info.path)
+        self._show_message(f"属性を {format_mode(op.new_mode)} にしました")
+
+    def change_times_current(self):
+        info = self._fresh_current()
+        if info is None:
+            return
+        if info.kind == "symlink":
+            self._show_message("シンボリックリンクの日時は変更できません")
+            return
+        try:
+            st = os.lstat(info.path)
+        except OSError as e:
+            self._warn("日時を読み取れませんでした。", e)
+            return
+        dialog = TimesDialog(info, st.st_atime_ns, st.st_mtime_ns, self)
+        if dialog.exec() != TimesDialog.Accepted:
+            return
+        try:
+            op = set_times(info.path, *dialog.times_ns())
+        except (OSError, ValueError, OverflowError) as e:
+            self._warn("日時を変更できませんでした。", e)
+            return
+        if op is None:
+            return
+        self.history.push(op)
+        self._refresh_path(info.path)
+        self._show_message("日時を変更しました")
+
+    # ---- 中身を見る ----
+    def view_current(self):
+        info = self._fresh_current()
+        if info is None:
+            return
+        if info.kind != "file":
+            self._show_message("中身を見られるのはファイルだけです")
+            return
+        try:
+            with open(info.path, "rb"):
+                pass
+        except OSError as e:
+            self._warn("ファイルを開けませんでした。", e)
+            return
+        ViewerWindow(info, self).show()
+
+    # ---- 元に戻す ----
+    def _update_undo_button(self):
+        op = self.history.peek()
+        self.undo_button.setEnabled(op is not None)
+        self.undo_button.setToolTip(f"元に戻す（Ctrl+Z）：{op.describe()}" if op else "元に戻す操作はありません")
+
+    def undo(self):
+        op = self.history.peek()
+        if op is None:
+            return
+        try:
+            try:
+                _, path = self.history.undo()
+            except UndoConflict as e:
+                answer = QMessageBox.question(
+                    self, APP_NAME, f"{e}。\nそれでも元に戻しますか？\n\n{op.describe()}",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+                _, path = self.history.undo(force=True)
+        except UndoError as e:
+            QMessageBox.warning(self, APP_NAME, f"元に戻せませんでした。\n{e}")
+            self._update_undo_button()
+            return
+        except OSError as e:
+            self._warn("元に戻せませんでした。", e)
+            self._update_undo_button()
+            return
+        if isinstance(op, RenameOp):
+            self._path_changed(op.new_path, op.old_path)
+        else:
+            self._refresh_path(path)
+        self._show_message(f"元に戻しました：{op.describe()}")
+
+    # ---- 一覧の更新 ----
+    def _path_changed(self, old, new):
+        """名前が変わったファイル（フォルダーなら中のファイルも）の行を付け替える。"""
+        old_prefix = old.rstrip("/") + "/"
+        current = None
+        for path in list(self.infos):
+            if path == old:
+                moved = new
+            elif path.startswith(old_prefix):
+                moved = new.rstrip("/") + "/" + path[len(old_prefix):]
+            else:
+                continue
+            item = self._set_info(inspect(moved, self.db), old_path=path)
+            if path == old:
+                current = item
+        if current is not None:
+            self.list.setCurrentItem(current)
+            self._show_info(self.infos[new])
+        self._update_undo_button()
+
+    def _refresh_path(self, path):
+        if path in self.infos:
+            item = self._set_info(inspect(path, self.db))
+            self.list.setCurrentItem(item)
+            self._show_info(self.infos[path])
+        self._update_undo_button()
+
+    def _context_menu(self, pos):
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
         self.list.setCurrentItem(item)
-        self._show_info(new_info)
-        self._show_message(f"「{fresh.name}」→「{new_info.name}」に変更しました")
+        info = self._current_info()
+        menu = QMenu(self)
+        view_action = menu.addAction("中身を見る", self.view_current)
+        view_action.setEnabled(info is not None and info.kind == "file")
+        menu.addSeparator()
+        menu.addAction("名前の変更…", self.rename_current)
+        mode_action = menu.addAction("属性の変更…", self.change_mode_current)
+        times_action = menu.addAction("日時の変更…", self.change_times_current)
+        if info is not None and info.kind in ("symlink", "missing"):
+            mode_action.setEnabled(False)
+            times_action.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("一覧から外す", lambda: self._remove_item(item))
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    def _remove_item(self, item):
+        path = item.data(0, PATH_ROLE)
+        self.infos.pop(path, None)
+        self.list.takeTopLevelItem(self.list.indexOfTopLevelItem(item))
+        if not self.infos:
+            self.clear()
 
     def _show_message(self, text):
         self.statusBar().setStyleSheet("")
@@ -378,6 +621,11 @@ class MainWindow(QMainWindow):
     def _show_info(self, info):
         self._show_banner(info)
         self._show_fix_row(info)
+        usable = info is not None and info.kind not in ("missing",)
+        self.view_button.setEnabled(usable and info.kind == "file")
+        self.rename_button.setEnabled(usable)
+        self.mode_button.setEnabled(usable and info.kind != "symlink")
+        self.times_button.setEnabled(usable and info.kind != "symlink")
         f = self.fields
         if info is None:
             for label in f.values():
@@ -388,6 +636,9 @@ class MainWindow(QMainWindow):
         f["folder"].setText(os.path.dirname(info.path))
         f["size"].setText(format_size(info.size) if info.kind == "file" else "")
         f["mtime"].setText(info.mtime.strftime("%Y-%m-%d %H:%M:%S") if info.mtime else "")
+        f["mode"].setText(
+            f"{format_mode(info.mode)}　{info.owner}:{info.group}" if info.mtime and info.kind != "symlink" else ""
+        )
         if info.error:
             f["type"].setStyleSheet(f"color: {RED};")
             f["type"].setText(info.error)
@@ -411,11 +662,17 @@ class MainWindow(QMainWindow):
             f["current_ext"].setText("")
             f["candidates"].setText("")
         self._fit_labels()
+        # 画面の配置が決まったあとで、もう一度高さを合わせる
+        QTimer.singleShot(0, self._fit_labels)
 
     def _fit_labels(self):
         # 折り返した文字が切れないよう、各欄の高さを内容に合わせる
         for label in self.fields.values():
-            label.setMinimumHeight(max(0, label.heightForWidth(label.width())))
+            width = label.width()
+            if width < 50:
+                continue  # まだ配置が決まっていない
+            label.setMinimumHeight(0)  # 前のファイルの高さが残らないように一度戻す
+            label.setMinimumHeight(max(0, label.heightForWidth(width)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

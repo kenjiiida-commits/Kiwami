@@ -1,10 +1,13 @@
 """ファイルの中身を調べて種類と本来の拡張子を判別し、今の拡張子と比べる。"""
 
+import grp
 import os
+import pwd
 import stat
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from . import textenc
 from .magic_lib import (
     MAGIC_EXTENSION,
     MAGIC_MIME_ENCODING,
@@ -38,6 +41,10 @@ class FileInfo:
     kind: str  # "file" / "dir" / "symlink" / "other" / "missing"
     size: int = 0
     mtime: datetime | None = None
+    atime: datetime | None = None
+    mode: int = 0  # 属性（パーミッション）の数字。例: 0o644
+    owner: str = ""
+    group: str = ""
     description: str = ""  # 判別エンジンの説明（英語）
     mime: str = ""
     encoding: str = ""
@@ -150,6 +157,20 @@ def judge(info, entry, binary_exts):
         info.suggestions = [s for s in info.suggestions if s != cur]
 
 
+def _user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def _group_name(gid):
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
 def inspect(path, db=None):
     path = os.path.abspath(path)
     name = os.path.basename(path.rstrip("/")) or path
@@ -166,6 +187,10 @@ def inspect(path, db=None):
         return info
 
     info.mtime = datetime.fromtimestamp(st.st_mtime)
+    info.atime = datetime.fromtimestamp(st.st_atime)
+    info.mode = stat.S_IMODE(st.st_mode)
+    info.owner = _user_name(st.st_uid)
+    info.group = _group_name(st.st_gid)
     if stat.S_ISLNK(st.st_mode):
         info.kind = "symlink"
         info.type_name = "シンボリックリンク"
@@ -208,6 +233,14 @@ def inspect(path, db=None):
             entry = db.lookup(info.mime)
         info.type_name = entry.name if entry else ""
         judge(info, entry, db.binary_exts)
+    if info.mime.startswith("text/") or info.status == OK_TEXT or info.mime == "application/json":
+        # 日本語の文字コードは判別エンジンより自前の判定のほうが正確
+        try:
+            with open(path, "rb") as f:
+                head = f.read(65536)
+            info.encoding = textenc.display_name(textenc.detect(head, truncated=info.size > len(head)))
+        except OSError:
+            pass
     return info
 
 
@@ -219,3 +252,14 @@ def format_size(n):
         value /= 1024
         if value < 1024 or unit == "TB":
             return f"{value:,.1f} {unit}（{n:,} バイト）"
+
+
+def format_size_short(n):
+    """一覧用の短い表示（例: 1.2 KB）。"""
+    if n < 1024:
+        return f"{n:,} B"
+    value = float(n)
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1024
+        if value < 1024 or unit == "TB":
+            return f"{value:,.1f} {unit}"
