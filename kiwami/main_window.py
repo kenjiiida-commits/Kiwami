@@ -205,7 +205,11 @@ class MainWindow(QMainWindow):
             "（複数選んでいれば選んだものだけ、そうでなければ一覧の全部が対象）"
         )
         self.bulk_fix_button.clicked.connect(self.bulk_fix)
+        self.select_all_button = QPushButton("すべて選択")
+        self.select_all_button.setToolTip("一覧のものを全部選びます（Ctrl+A）。もう一度押すと選択を解除します")
+        self.select_all_button.clicked.connect(self.toggle_select_all)
         pack.addWidget(self.extract_button)
+        pack.addWidget(self.select_all_button)
         pack.addWidget(self.compress_button)
         pack.addStretch(1)
         pack.addWidget(self.bulk_fix_button)
@@ -904,6 +908,7 @@ class MainWindow(QMainWindow):
         if info is not None and info.kind in ("symlink", "missing"):
             mode_action.setEnabled(False)
             times_action.setEnabled(False)
+        menu.addAction("すべて選択（Ctrl+A）", self.list.selectAll)
         if info is not None and info.kind == "dir":
             menu.addAction("フォルダーの中身を一覧に入れる", lambda: self.add_folder_contents(info.path))
         menu.addSeparator()
@@ -923,10 +928,21 @@ class MainWindow(QMainWindow):
             self._remove_item(item)
         self._update_selection_buttons()
 
+    def toggle_select_all(self):
+        total = self.list.topLevelItemCount()
+        if total and len(self.list.selectedItems()) == total:
+            self.list.clearSelection()
+        else:
+            self.list.selectAll()
+        self.list.setFocus()
+
     def _update_selection_buttons(self):
         """複数選んだときのボタンの文字と、まとめて直すボタンの表示。"""
         count = len([i for i in self.list.selectedItems()])
+        total = self.list.topLevelItemCount()
         multi = count > 1
+        self.select_all_button.setEnabled(total > 0)
+        self.select_all_button.setText("選択を解除" if total > 1 and count == total else "すべて選択")
         self.rename_button.setEnabled(not multi and self._current_info() is not None
                                       and self._current_info().kind != "missing")
         self.mode_button.setText(f"属性（{count}）" if multi else "属性")
